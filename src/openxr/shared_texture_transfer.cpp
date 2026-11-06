@@ -3,7 +3,8 @@
 #include "immediate_executor.h"
 #include "gpu_work_observer.h"
 #include "producer_gpu_timing.h"
-#include <d3d11_1.h>
+#include "native_trace.h"
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <exception>
@@ -78,6 +79,30 @@ HRESULT timeoutResult() noexcept {
   return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
 }
 
+// How long the one-time fence probe may wait for each direction's first
+// signal. The signal queues behind the GPU work already submitted on that
+// device, so this is generous; a miss only selects the keyed-mutex handoff.
+constexpr DWORD kFenceProbeMs = 2000;
+
+// Polls a fence on the owner thread until it reaches value. UINT64_MAX is a
+// removed device, never a reached value.
+bool fenceReached(ID3D11Fence* fence, UINT64 value, DWORD timeoutMs) noexcept {
+  const ULONGLONG started = GetTickCount64();
+  for (;;) {
+    const UINT64 completed = fence->GetCompletedValue();
+    if (completed != UINT64_MAX && completed >= value) return true;
+    if (completed == UINT64_MAX || GetTickCount64() - started >= timeoutMs) return false;
+    Sleep(1);
+  }
+}
+
+HRESULT shareFence(ID3D11Fence* fence, HANDLE& handle) noexcept {
+  handle = nullptr;
+  const HRESULT result = fence->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &handle);
+  if (result == S_OK && !handle) return E_FAIL;
+  return result;
+}
+
 }  // namespace
 
 struct SharedTextureTransfer::Impl final {
@@ -89,15 +114,24 @@ struct SharedTextureTransfer::Impl final {
     return owner == std::this_thread::get_id();
   }
 
+  bool fenced() const noexcept {
+    return readyOnProducer && readyOnConsumer && freeOnConsumer && freeOnProducer;
+  }
+
   bool hasResources() const noexcept {
-    return sharedProducer && sharedConsumer && privateTexture &&
-        producerMutex && consumerMutex && consumerEvent;
+    return sharedProducer && sharedConsumer && privateTexture && consumerEvent &&
+        (fenced() || (producerMutex && consumerMutex));
   }
 
   void clearResources() noexcept {
     consumerEvent.Reset();
     consumerMutex.Reset();
     producerMutex.Reset();
+    freeOnProducer.Reset();
+    freeOnConsumer.Reset();
+    readyOnConsumer.Reset();
+    readyOnProducer.Reset();
+    fenceValue = 0;
     privateTexture.Reset();
     sharedConsumer.Reset();
     sharedProducer.Reset();
@@ -119,6 +153,8 @@ struct SharedTextureTransfer::Impl final {
     if (!adapterLuid(consumerDevice, consumerLuid)) return E_NOINTERFACE;
 
     ComPtr<ID3D11DeviceContext> producerImmediate;
+    ComPtr<ID3D11Device5> producer5;
+    ComPtr<ID3D11DeviceContext4> producerImmediate4;
     LUID producerLuid{};
     bool producerValid = false;
     bool invoked = false;
@@ -128,6 +164,12 @@ struct SharedTextureTransfer::Impl final {
         producerDevice->GetImmediateContext(&producerImmediate);
         producerValid = producerValid && producerImmediate &&
             sameLuid(producerLuid, consumerLuid);
+        if (producerValid &&
+            (FAILED(producerDevice->QueryInterface(IID_PPV_ARGS(&producer5))) ||
+             FAILED(producerImmediate.As(&producerImmediate4)))) {
+          producer5.Reset();
+          producerImmediate4.Reset();
+        }
       });
     } catch (...) {}
     if (!invoked || !producerValid) return invoked ? E_INVALIDARG : E_ABORT;
@@ -140,12 +182,26 @@ struct SharedTextureTransfer::Impl final {
     if (FAILED(consumerDevice->QueryInterface(IID_PPV_ARGS(&consumer1))) || !consumer1)
       return E_NOINTERFACE;
 
+    ComPtr<ID3D11Device5> consumer5;
+    ComPtr<ID3D11DeviceContext4> consumerImmediate4;
+    if (FAILED(consumerDevice->QueryInterface(IID_PPV_ARGS(&consumer5))) ||
+        FAILED(consumerImmediate.As(&consumerImmediate4))) {
+      consumer5.Reset();
+      consumerImmediate4.Reset();
+    }
+
     producer = producerDevice;
     consumer = consumerDevice;
     producerContext = std::move(producerImmediate);
     consumerContext = std::move(consumerImmediate);
     producerExecutor = executor;
     consumerDevice1 = std::move(consumer1);
+    producerDevice5 = std::move(producer5);
+    consumerDevice5 = std::move(consumer5);
+    producerContext4 = std::move(producerImmediate4);
+    consumerContext4 = std::move(consumerImmediate4);
+    fencesRefused = !(producerDevice5 && consumerDevice5 && producerContext4 && consumerContext4);
+    syncReported = false;
     initialized = true;
     return S_OK;
   }
@@ -161,6 +217,154 @@ struct SharedTextureTransfer::Impl final {
       if (drained != S_OK) return drained;
     }
 
+    if (!fencesRefused) {
+      const HRESULT fencedResult = createFencedResources(sourceDescription, choice);
+      if (fencedResult == S_OK) {
+        reportSync("fence", S_OK);
+        return S_OK;
+      }
+      if (fencedResult == E_ABORT) return E_ABORT;
+      // Shared fences are missing or do not cross the two devices: keep the
+      // keyed-mutex handoff for the rest of this transfer's life.
+      fencesRefused = true;
+      reportSync("keyed_mutex", fencedResult);
+    } else {
+      reportSync("keyed_mutex", E_NOINTERFACE);
+    }
+    return createKeyedResources(sourceDescription, choice);
+  }
+
+  void reportSync(const char* mode, HRESULT why) noexcept {
+    if (syncReported) return;
+    syncReported = true;
+    nativeTracePrintf("native_transfer_sync,mode=%s,fence_hr=%08lx\n", mode,
+                      static_cast<unsigned long>(why));
+  }
+
+  // GPU-side handoff: the producer queues Signal(ready, n) after its copy and
+  // the consumer queues Wait(ready, n) before its own; the free fence runs the
+  // other way so the producer's next copy waits on the GPU for the consumer's
+  // read. Neither CPU thread blocks. Under DXVK, IDXGIKeyedMutex::ReleaseSync
+  // waits on the CPU for all of the producer's queued GPU work, which held the
+  // game's render thread for most of a frame (native_submit_phases
+  // producer_release, Proton 2026-11-06). A probe proves both fences cross the
+  // two devices before any frame relies on them.
+  HRESULT createFencedResources(const D3D11_TEXTURE2D_DESC& sourceDescription,
+                                const FormatChoice& choice) noexcept {
+    D3D11_TEXTURE2D_DESC sharedDescription = sourceDescription;
+    sharedDescription.Format = choice.shared;
+    sharedDescription.Usage = D3D11_USAGE_DEFAULT;
+    // Copy destinations only; see createKeyedResources for why there is no RTV.
+    sharedDescription.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    sharedDescription.CPUAccessFlags = 0;
+    sharedDescription.MiscFlags = D3D11_RESOURCE_MISC_SHARED |
+        D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    D3D11_TEXTURE2D_DESC privateDescription = sharedDescription;
+    privateDescription.Format = choice.privateFormat;
+    privateDescription.MiscFlags = 0;
+
+    ComPtr<ID3D11Texture2D> nextSharedProducer;
+    ComPtr<ID3D11Fence> nextReadyOnProducer;
+    HANDLE textureHandle = nullptr, readyHandle = nullptr;
+    HRESULT producerResult = E_FAIL;
+    bool callbackRan = false;
+    try {
+      (void)producerExecutor->invoke([&] {
+        callbackRan = true;
+        producerResult = producer->CreateTexture2D(&sharedDescription, nullptr,
+                                                   &nextSharedProducer);
+        if (producerResult != S_OK) return;
+        ComPtr<IDXGIResource1> resource;
+        producerResult = nextSharedProducer.As(&resource);
+        if (producerResult != S_OK) return;
+        producerResult = resource->CreateSharedHandle(nullptr,
+            DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+            nullptr, &textureHandle);
+        if (producerResult != S_OK) return;
+        producerResult = producerDevice5->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
+                                                      IID_PPV_ARGS(&nextReadyOnProducer));
+        if (producerResult != S_OK) return;
+        producerResult = shareFence(nextReadyOnProducer.Get(), readyHandle);
+      });
+    } catch (...) {}
+    const auto closeHandles = [&] {
+      if (textureHandle) CloseHandle(textureHandle);
+      if (readyHandle) CloseHandle(readyHandle);
+      textureHandle = readyHandle = nullptr;
+    };
+    if (!callbackRan) { closeHandles(); return E_ABORT; }
+    if (producerResult != S_OK) { closeHandles(); return producerResult; }
+
+    ComPtr<ID3D11Texture2D> nextSharedConsumer;
+    ComPtr<ID3D11Fence> nextReadyOnConsumer, nextFreeOnConsumer, nextFreeOnProducer;
+    ComPtr<ID3D11Texture2D> nextPrivate;
+    ComPtr<ID3D11Query> nextEvent;
+    HRESULT result = consumerDevice1->OpenSharedResource1(
+        textureHandle, IID_PPV_ARGS(&nextSharedConsumer));
+    if (result == S_OK)
+      result = consumerDevice5->OpenSharedFence(readyHandle, IID_PPV_ARGS(&nextReadyOnConsumer));
+    closeHandles();
+    if (result == S_OK)
+      result = consumerDevice5->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
+                                            IID_PPV_ARGS(&nextFreeOnConsumer));
+    HANDLE freeHandle = nullptr;
+    if (result == S_OK) result = shareFence(nextFreeOnConsumer.Get(), freeHandle);
+    if (result == S_OK) {
+      HRESULT openResult = E_FAIL;
+      bool openRan = false;
+      try {
+        (void)producerExecutor->invoke([&] {
+          openRan = true;
+          openResult = producerDevice5->OpenSharedFence(freeHandle,
+                                                        IID_PPV_ARGS(&nextFreeOnProducer));
+        });
+      } catch (...) {}
+      result = openRan ? openResult : E_ABORT;
+    }
+    if (freeHandle) CloseHandle(freeHandle);
+    if (result == S_OK)
+      result = consumer->CreateTexture2D(&privateDescription, nullptr, &nextPrivate);
+    if (result == S_OK) {
+      const D3D11_QUERY_DESC queryDescription{D3D11_QUERY_EVENT, 0};
+      result = consumer->CreateQuery(&queryDescription, &nextEvent);
+    }
+    if (result != S_OK) return result;
+    if (!nextSharedConsumer || !nextReadyOnConsumer || !nextFreeOnConsumer ||
+        !nextFreeOnProducer || !nextPrivate || !nextEvent) return E_FAIL;
+
+    // Probe both directions with value 1. A fence that only looks shared (an
+    // import the driver ignored) never reaches 1 on the other device.
+    bool signalled = false;
+    try {
+      (void)producerExecutor->invoke([&] {
+        signalled = producerContext4->Signal(nextReadyOnProducer.Get(), 1) == S_OK;
+        producerContext->Flush();
+      });
+    } catch (...) {}
+    if (!signalled || !fenceReached(nextReadyOnConsumer.Get(), 1, kFenceProbeMs))
+      return DXGI_ERROR_UNSUPPORTED;
+    if (consumerContext4->Signal(nextFreeOnConsumer.Get(), 1) != S_OK) return DXGI_ERROR_UNSUPPORTED;
+    consumerContext->Flush();
+    if (!fenceReached(nextFreeOnProducer.Get(), 1, kFenceProbeMs)) return DXGI_ERROR_UNSUPPORTED;
+
+    clearResources();
+    sharedProducer = std::move(nextSharedProducer);
+    sharedConsumer = std::move(nextSharedConsumer);
+    privateTexture = std::move(nextPrivate);
+    readyOnProducer = std::move(nextReadyOnProducer);
+    readyOnConsumer = std::move(nextReadyOnConsumer);
+    freeOnConsumer = std::move(nextFreeOnConsumer);
+    freeOnProducer = std::move(nextFreeOnProducer);
+    consumerEvent = std::move(nextEvent);
+    fenceValue = 1;
+    sourceWidth = sourceDescription.Width;
+    sourceHeight = sourceDescription.Height;
+    sourceFamily = choice.family;
+    return S_OK;
+  }
+
+  HRESULT createKeyedResources(const D3D11_TEXTURE2D_DESC& sourceDescription,
+                               const FormatChoice& choice) noexcept {
     D3D11_TEXTURE2D_DESC sharedDescription = sourceDescription;
     sharedDescription.Format = choice.shared;
     sharedDescription.Usage = D3D11_USAGE_DEFAULT;
@@ -252,6 +456,7 @@ struct SharedTextureTransfer::Impl final {
   HRESULT producerCopy(ID3D11Texture2D* source, DWORD timeoutMs,
                        TransferWallTimes* times, ProducerGpuTiming* producerTiming) noexcept {
     if (!source || !hasResources()) return E_INVALIDARG;
+    if (fenced()) return producerCopyFenced(source, times, producerTiming);
     HRESULT mutexResult = E_FAIL;
     bool callbackRan = false;
     bool callbackCompleted = false;
@@ -294,9 +499,75 @@ struct SharedTextureTransfer::Impl final {
     return S_OK;
   }
 
+  // The fenced producer half. The callback never waits on the CPU: the GPU
+  // waits for the consumer's previous read (free >= fenceValue) before the
+  // copy, and ready = fenceValue + 1 is queued after it and flushed so the
+  // consumer's wait can never precede a signal still sitting in a queue.
+  HRESULT producerCopyFenced(ID3D11Texture2D* source, TransferWallTimes* times,
+                             ProducerGpuTiming* producerTiming) noexcept {
+    HRESULT result = E_FAIL;
+    bool callbackRan = false;
+    bool callbackCompleted = false;
+    const UINT64 next = fenceValue + 1;
+    try {
+      SubmissionWallScope dispatch(times?&times->producerDispatch:nullptr);
+      (void)producerExecutor->invoke([&] {
+        callbackRan = true;
+        SubmissionWallScope callback(times?&times->producerCallback:nullptr);
+        { SubmissionWallScope measured(times?&times->producerAcquire:nullptr);
+          result = producerContext4->Wait(freeOnProducer.Get(), fenceValue); }
+        if (result != S_OK) { callbackCompleted = true; return; }
+        if (producerTiming) {
+          producerTiming->poll(GetTickCount64());
+          producerTiming->beginCopy(producer.Get(), producerContext.Get());
+        }
+        { SubmissionWallScope measured(times?&times->producerCopy:nullptr);
+          producerContext->CopyResource(sharedProducer.Get(), source); }
+        HRESULT signalResult;
+        { SubmissionWallScope measured(times?&times->producerRelease:nullptr);
+          signalResult = producerContext4->Signal(readyOnProducer.Get(), next); }
+        { SubmissionWallScope measured(times?&times->producerFlush:nullptr);
+          producerContext->Flush(); }
+        if (producerTiming) producerTiming->endCopy();
+        const HRESULT deviceResult = producer->GetDeviceRemovedReason();
+        result = deviceResult == S_OK ? signalResult : deviceResult;
+        callbackCompleted = true;
+      });
+    } catch (...) {}
+    if (!callbackRan) return E_ABORT;
+    if (!callbackCompleted || result != S_OK) { faulted = true; return callbackCompleted ? result : E_FAIL; }
+    pendingStage = Stage::ConsumerAcquire;
+    return S_OK;
+  }
+
+  // The fenced consumer half: GPU wait for ready, copy, then signal free.
+  HRESULT consumeFenced(GpuWorkObserver* observer, unsigned phase,
+                        TransferWallTimes* times) noexcept {
+    const UINT64 next = fenceValue + 1;
+    HRESULT result;
+    { SubmissionWallScope measured(times?&times->consumerAcquire:nullptr);
+      result = consumerContext4->Wait(readyOnConsumer.Get(), next); }
+    if (result != S_OK) { faulted = true; return result; }
+    if(observer) observer->beginGpuWork(phase, consumerContext.Get());
+    consumerContext->CopyResource(privateTexture.Get(), sharedConsumer.Get());
+    if(observer) observer->endGpuWork(phase, consumerContext.Get());
+    HRESULT signalResult;
+    { SubmissionWallScope measured(times?&times->consumerRelease:nullptr);
+      signalResult = consumerContext4->Signal(freeOnConsumer.Get(), next); }
+    { SubmissionWallScope measured(times?&times->consumerFlush:nullptr);
+      consumerContext->Flush(); }
+    const HRESULT deviceResult = consumer->GetDeviceRemovedReason();
+    result = deviceResult == S_OK ? signalResult : deviceResult;
+    if (result != S_OK) { faulted = true; return result; }
+    fenceValue = next;
+    pendingStage = Stage::None;
+    return S_OK;
+  }
+
   HRESULT consume(DWORD timeoutMs, GpuWorkObserver* observer = nullptr, unsigned phase = 0,
                   TransferWallTimes* times = nullptr) noexcept {
     if (!hasResources() || pendingStage != Stage::ConsumerAcquire) return E_INVALIDARG;
+    if (fenced()) return consumeFenced(observer, phase, times);
     HRESULT mutexResult;
     { SubmissionWallScope measured(times?&times->consumerAcquire:nullptr);
       mutexResult = consumerMutex->AcquireSync(1, timeoutMs); }
@@ -382,6 +653,10 @@ struct SharedTextureTransfer::Impl final {
     clearResources();
     pendingStage = Stage::None;
     consumerDevice1.Reset();
+    consumerContext4.Reset();
+    producerContext4.Reset();
+    consumerDevice5.Reset();
+    producerDevice5.Reset();
     consumerContext.Reset();
     producerContext.Reset();
     consumer.Reset();
@@ -407,6 +682,20 @@ struct SharedTextureTransfer::Impl final {
   ComPtr<IDXGIKeyedMutex> producerMutex;
   ComPtr<IDXGIKeyedMutex> consumerMutex;
   ComPtr<ID3D11Query> consumerEvent;
+  // Fenced handoff (see createFencedResources). ready: producer signals,
+  // consumer waits. free: consumer signals, producer waits. fenceValue is the
+  // last value both reached.
+  ComPtr<ID3D11Device5> producerDevice5;
+  ComPtr<ID3D11Device5> consumerDevice5;
+  ComPtr<ID3D11DeviceContext4> producerContext4;
+  ComPtr<ID3D11DeviceContext4> consumerContext4;
+  ComPtr<ID3D11Fence> readyOnProducer;
+  ComPtr<ID3D11Fence> readyOnConsumer;
+  ComPtr<ID3D11Fence> freeOnConsumer;
+  ComPtr<ID3D11Fence> freeOnProducer;
+  UINT64 fenceValue = 0;
+  bool fencesRefused = false;
+  bool syncReported = false;
   UINT sourceWidth = 0, sourceHeight = 0;
   PixelFamily sourceFamily = PixelFamily::RGBA8;
 };

@@ -12,7 +12,10 @@ struct GpuWorkObserver;
 class ProducerGpuTiming;
 
 // Experimental CPU-owned handoff for copying one producer-device texture to a
-// private texture on a distinct consumer device. Construct this object on the
+// private texture on a distinct consumer device. Where both devices share
+// D3D11 fences (probed once per resource shape), the handoff is GPU-side and
+// neither thread waits; otherwise it uses the shared keyed mutex, and the
+// timeouts below apply. native_transfer_sync in the log names which. Construct this object on the
 // consumer/XR owner thread and call every method below from that same thread.
 // The producer context is touched only inside the supplied ImmediateExecutor.
 //
