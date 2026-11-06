@@ -374,6 +374,10 @@ void deferredIntegration(Fixture& f) {
     check(readback(f,output,format,W,H,pattern(format,W,H,701)),"deferred pixels precede producer overwrite for every format");
     check(times.producerDispatch>=times.producerAcquire&&times.producerAcquire>=0&&times.producerFlush>=0&&
       times.consumerAcquire>=0&&times.consumerFlush>=0,"transfer wall measurements are finite ordered scopes");
+    check(times.producerDispatch>=times.producerCallback&&
+      times.producerCallback>=times.producerAcquire+times.producerCopy+times.producerFlush+times.producerRelease&&
+      times.producerCopy>=0&&times.producerRelease>=0&&times.consumerRelease>=0,
+      "producer callback, copy and release scopes nest inside the dispatch");
     check(transfer.shutdown()==S_OK&&f.executor.calls()==calls,"deferred transfer retires without producer");
     f.executor.resume();
   }

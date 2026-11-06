@@ -20,6 +20,9 @@ class SubmissionWallScope final {
 struct TransferWallTimes {
   double producerDispatch=0, producerAcquire=0, producerFlush=0;
   double consumerAcquire=0, consumerFlush=0;
+  // producerCallback is the whole callback on the producer executor, so
+  // producerDispatch minus producerCallback is the wait for that executor.
+  double producerCallback=0, producerCopy=0, producerRelease=0, consumerRelease=0;
 };
 struct StereoWallTimes {
   double acquire=0, wait=0, draw=0, release=0;

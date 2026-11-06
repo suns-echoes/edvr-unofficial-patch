@@ -1847,6 +1847,10 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     submitSample.producerFlushMs=transferWall.producerFlush;
     submitSample.consumerAcquireMs=transferWall.consumerAcquire;
     submitSample.consumerFlushMs=transferWall.consumerFlush;
+    submitSample.producerCallbackMs=transferWall.producerCallback;
+    submitSample.producerCopyMs=transferWall.producerCopy;
+    submitSample.producerReleaseMs=transferWall.producerRelease;
+    submitSample.consumerReleaseMs=transferWall.consumerRelease;
     submitSample.endFrameMs=boundary.endFrameMs();
     submitSample.waitFrameMs=boundary.waitBlockMs();
     submitSample.pacerBlockMs=boundary.pacerBlockMs();
@@ -1876,6 +1880,10 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       submitSample.producerFlushMs=transferWall.producerFlush;
       submitSample.consumerAcquireMs=transferWall.consumerAcquire;
       submitSample.consumerFlushMs=transferWall.consumerFlush;
+      submitSample.producerCallbackMs=transferWall.producerCallback;
+      submitSample.producerCopyMs=transferWall.producerCopy;
+      submitSample.producerReleaseMs=transferWall.producerRelease;
+      submitSample.consumerReleaseMs=transferWall.consumerRelease;
       submitSample.endFrameMs=boundary.endFrameMs();
       submitSample.waitFrameMs=boundary.waitBlockMs();
       submitSample.pacerBlockMs=boundary.pacerBlockMs();
@@ -2483,6 +2491,10 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     phase("xr_end_frame",&SubmissionStats::Sample::endFrameMs);
     phase("wait_frame",&SubmissionStats::Sample::waitFrameMs);
     phase("pacer_block",&SubmissionStats::Sample::pacerBlockMs);
+    phase("producer_callback",&SubmissionStats::Sample::producerCallbackMs);
+    phase("producer_copy",&SubmissionStats::Sample::producerCopyMs);
+    phase("producer_release",&SubmissionStats::Sample::producerReleaseMs);
+    phase("consumer_release",&SubmissionStats::Sample::consumerReleaseMs);
     nativeTracePrintf("native_submit_phases,window=%llu,first=%llu,last=%llu,output=%ux%u/%ux%u,treatments=%u/%u,feature_epoch=%llu,trim_stage=%u,trim_factors=%.5f/%.5f,pacing=%u,separate=%u%s,percentiles=50/95/99/max,units=wall_ms,nested=1,gpu=0,frame_end_overlap=%u\n",
       (unsigned long long)submitStats.window(),(unsigned long long)first.sequence,(unsigned long long)last.sequence,
       last.outputWidth[0],last.outputHeight[0],last.outputWidth[1],last.outputHeight[1],last.treatments[0],last.treatments[1],

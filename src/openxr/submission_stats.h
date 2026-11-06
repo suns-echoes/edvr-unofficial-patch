@@ -16,6 +16,7 @@ class SubmissionStats final {
     double submitMs = 0, dispatchMs = 0, treatmentMs = 0;
     double producerDispatchMs=0, producerAcquireMs=0, producerFlushMs=0;
     double consumerAcquireMs=0, consumerFlushMs=0, receiveMs=0;
+    double producerCallbackMs=0, producerCopyMs=0, producerReleaseMs=0, consumerReleaseMs=0;
     double xrAcquireMs=0, xrWaitMs=0, xrDrawMs=0, xrReleaseMs=0, endFrameMs=0;
     // Turbo pacing: how long waitAndBegin blocked (0 for a synthesized
     // frame), how long finish()/clear() blocked taking the pacer's real
@@ -45,7 +46,8 @@ class SubmissionStats final {
     for(double value:{sample.producerDispatchMs,sample.producerAcquireMs,sample.producerFlushMs,
         sample.consumerAcquireMs,sample.consumerFlushMs,sample.receiveMs,sample.xrAcquireMs,
         sample.xrWaitMs,sample.xrDrawMs,sample.xrReleaseMs,sample.endFrameMs,
-        sample.waitFrameMs,sample.pacerBlockMs})
+        sample.waitFrameMs,sample.pacerBlockMs,sample.producerCallbackMs,sample.producerCopyMs,
+        sample.producerReleaseMs,sample.consumerReleaseMs})
       if(!std::isfinite(value)||value<0) return false;
     const bool gap=lastSequence_&&sample.sequence!=lastSequence_+1;
     lastSequence_ = sample.sequence;

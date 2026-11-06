@@ -259,6 +259,7 @@ struct SharedTextureTransfer::Impl final {
       SubmissionWallScope dispatch(times?&times->producerDispatch:nullptr);
       (void)producerExecutor->invoke([&] {
         callbackRan = true;
+        SubmissionWallScope callback(times?&times->producerCallback:nullptr);
         { SubmissionWallScope measured(times?&times->producerAcquire:nullptr);
           mutexResult = producerMutex->AcquireSync(0, timeoutMs); }
         if (mutexResult != S_OK) { callbackCompleted = true; return; }
@@ -266,12 +267,15 @@ struct SharedTextureTransfer::Impl final {
           producerTiming->poll(GetTickCount64());
           producerTiming->beginCopy(producer.Get(), producerContext.Get());
         }
-        producerContext->CopyResource(sharedProducer.Get(), source);
+        { SubmissionWallScope measured(times?&times->producerCopy:nullptr);
+          producerContext->CopyResource(sharedProducer.Get(), source); }
         { SubmissionWallScope measured(times?&times->producerFlush:nullptr);
           producerContext->Flush(); }
         if (producerTiming) producerTiming->endCopy();
         const HRESULT deviceResult = producer->GetDeviceRemovedReason();
-        const HRESULT releaseResult = producerMutex->ReleaseSync(1);
+        HRESULT releaseResult;
+        { SubmissionWallScope measured(times?&times->producerRelease:nullptr);
+          releaseResult = producerMutex->ReleaseSync(1); }
         mutexResult = deviceResult == S_OK ? releaseResult : deviceResult;
         callbackCompleted = true;
       });
@@ -310,7 +314,9 @@ struct SharedTextureTransfer::Impl final {
     { SubmissionWallScope measured(times?&times->consumerFlush:nullptr);
       consumerContext->Flush(); }
     const HRESULT deviceResult = consumer->GetDeviceRemovedReason();
-    const HRESULT releaseResult = consumerMutex->ReleaseSync(0);
+    HRESULT releaseResult;
+    { SubmissionWallScope measured(times?&times->consumerRelease:nullptr);
+      releaseResult = consumerMutex->ReleaseSync(0); }
     mutexResult = deviceResult == S_OK ? releaseResult : deviceResult;
     if (mutexResult != S_OK) {
       faulted = true;
